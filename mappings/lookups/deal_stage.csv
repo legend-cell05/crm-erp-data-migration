@@ -1,0 +1,8 @@
+source;target
+NEW;new
+QUAL;qualified
+PROP;proposal
+NEGO;negotiation
+WON;closed_won
+LOST;closed_lost
+ABD;abandoned

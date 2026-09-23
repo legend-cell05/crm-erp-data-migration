@@ -1,0 +1,102 @@
+# ===========================================================================
+# Arcadia `person` -> Atlas Cloud `contacts`
+# ===========================================================================
+version: "1.2.0"
+entity: contact
+description: People. Depends on accounts, because a contact without a company is not migrated.
+depends_on: [account]
+
+source:
+  kind: sql
+  schema: legacy
+  table: person
+  key: persno
+  filter: "COALESCE(del_flag, 'N') <> 'Y'"
+
+target:
+  entity_set: contacts
+  alternate_key: arcadia_id
+
+fields:
+  - target: arcadia_id
+    source: persno
+    transform: [trim, upper]
+    required: true
+
+  - target: account_id
+    source: custno
+    transform: [trim, upper]
+    reference:
+      entity: account
+      on_missing: reject
+    required: true
+    description: >
+      Resolved through the crosswalk, so this is also the check that catches
+      contacts pointing at companies that no longer exist. Rejecting is
+      deliberate: a contact with no company is unusable in the target, and
+      creating a placeholder company to hold it would invent data.
+
+  - target: first_name
+    source: fname
+    transform: [fix_mojibake, collapse_spaces, title_case, { fn: truncate, length: 60 }]
+
+  - target: last_name
+    source: lname
+    transform: [fix_mojibake, collapse_spaces, title_case, { fn: truncate, length: 60 }]
+    required: true
+
+  - target: job_title
+    source: title
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 100 }]
+
+  - target: email
+    source: email
+    transform: [{ fn: normalise_email, on_invalid: "null" }]
+    description: >
+      on_invalid: null, not reject. An unusable address is a reason to lose
+      the address, not the person -- and the count lands in the impact report
+      so the business can see how many contacts arrive unreachable by email.
+
+  - target: telephone
+    source: phone
+    transform: [{ fn: normalise_phone, default_country_code: "33" }]
+
+  - target: mobile
+    source: mobile
+    transform: [{ fn: normalise_phone, default_country_code: "33" }]
+
+  - target: contact_role
+    source: role_cd
+    transform: [trim, upper]
+    lookup:
+      table: contact_role
+      on_miss: "null"
+
+  - target: do_not_email
+    source: opt_out
+    transform:
+      - { fn: map_boolean, default: false }
+    required: false
+    description: >
+      NULL means false here, and that is a decision with consequences: an
+      opt-out that arrives as false is a marketing email to someone who asked
+      not to receive one. It is stated in the mapping so it can be argued
+      about before the migration, not after.
+
+  - target: created_on
+    source: created
+    transform: [{ fn: parse_date, day_first: true }]
+
+  - target: source_system
+    transform: [{ fn: constant, value_to_use: arcadia }]
+    required: true
+
+validations:
+  - rule: at_least_one
+    fields: [email, telephone, mobile]
+    severity: warn
+    message: contact has no usable means of contact
+
+  - rule: not_after_today
+    fields: [created_on]
+    args: { tolerance_days: 1 }

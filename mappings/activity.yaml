@@ -1,0 +1,91 @@
+# ===========================================================================
+# Arcadia nightly CSV export -> Atlas Cloud `activities`
+#
+# The one entity that does not come from the database. Arcadia archived its
+# activity log to files, and those files are semicolon-separated cp1252 --
+# which is what the export job produced and what the sales team opens in
+# Excel. A migration tool that assumes UTF-8 and commas fails on row four.
+# ===========================================================================
+version: "1.0.1"
+entity: activity
+description: Calls, meetings, emails and notes, read from the nightly CSV export.
+depends_on: [account, contact, opportunity]
+
+source:
+  kind: csv
+  path_glob: "legacy_exports/ACT_EXPORT_*.csv"
+  encoding: cp1252
+  delimiter: ";"
+  key: ACTNO
+  exclude_when:
+    DEL_FLAG: "Y"
+
+target:
+  entity_set: activities
+  alternate_key: arcadia_id
+
+fields:
+  - target: arcadia_id
+    source: ACTNO
+    transform: [trim, upper]
+    required: true
+
+  - target: account_id
+    source: CUSTNO
+    transform: [trim, upper]
+    reference:
+      entity: account
+      on_missing: reject
+    required: true
+
+  - target: contact_id
+    source: PERSNO
+    transform: [trim, upper]
+    reference:
+      entity: contact
+      on_missing: "null"
+
+  - target: opportunity_id
+    source: DEALNO
+    transform: [trim, upper]
+    reference:
+      entity: opportunity
+      on_missing: "null"
+
+  - target: activity_type
+    source: ACT_TYPE
+    transform: [trim, upper]
+    lookup:
+      table: activity_type
+      on_miss: reject
+    required: true
+
+  - target: subject
+    source: SUBJ
+    transform:
+      - fix_mojibake
+      - collapse_spaces
+      - { fn: truncate, length: 200 }
+    required: true
+
+  - target: body
+    source: BODY
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 4000 }]
+
+  - target: activity_date
+    source: ACT_DT
+    transform: [{ fn: parse_date, day_first: true }]
+    required: true
+
+  - target: owner_code
+    source: OWNER_ID
+    transform: [trim, upper]
+
+  - target: source_system
+    transform: [{ fn: constant, value_to_use: arcadia }]
+    required: true
+
+validations:
+  - rule: not_after_today
+    fields: [activity_date]
+    args: { tolerance_days: 1 }
