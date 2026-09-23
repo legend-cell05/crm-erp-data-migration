@@ -243,8 +243,12 @@ def _parse_amount(value: Any, *, decimals: int = 2) -> Any:
     text = str(value).strip()
     if not text:
         return None
+    # Currency codes go first, while the spaces that delimit them still
+    # exist: stripping spaces first turns '12 500,00 EUR' into
+    # '12500,00EUR', where \b no longer matches and the code survives into
+    # Decimal().
+    text = re.sub(r"(?i)(eur|usd|chf|gbp)", "", text).strip()
     text = text.translate(_CURRENCY_CHARS)
-    text = re.sub(r"(?i)\b(eur|usd|chf|gbp)\b", "", text).strip()
     if not text or not re.search(r"\d", text):
         raise ValueError(f"no number in {value!r}")
 
@@ -350,11 +354,19 @@ def _normalise_phone(
     if not text:
         return None
     text = re.sub(r"(?i)\b(poste|ext\.?|extension)\b.*$", "", text).strip()
+    # '+33 (0)2 19 ...' carries both the country code and the national trunk
+    # prefix. Keeping the 0 produces a number one digit too long that looks
+    # plausible -- the worst kind of wrong, because it dials.
+    text = re.sub(r"\(\s*0\s*\)", "", text)
     digits = re.sub(r"[^\d+]", "", text)
     if digits.startswith("00"):
         digits = "+" + digits[2:]
     if digits.startswith("+"):
-        cleaned = "+" + re.sub(r"\D", "", digits[1:])
+        body = re.sub(r"\D", "", digits[1:])
+        # A trunk prefix that survived the parentheses: +33 0X XX ...
+        if body.startswith(f"{default_country_code}0"):
+            body = default_country_code + body[len(default_country_code) + 1 :]
+        cleaned = f"+{body}"
     elif digits.startswith("0"):
         cleaned = f"+{default_country_code}{digits[1:]}"
     else:
