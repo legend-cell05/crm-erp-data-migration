@@ -79,6 +79,25 @@ class TestTheGate:
         assert summary.records_read > 0
 
 
+class TestInitIsSafe:
+    def test_re_running_init_db_does_not_empty_the_source(
+        self, migrated: tuple[Settings, MappingSet, AtlasClient, TestClient]
+    ) -> None:
+        """Regression: the legacy schema file used to begin with DROP TABLE.
+
+        `init-db` is documented as safe to re-run, and it was not: running it a
+        second time silently emptied the source system, and the next dry-run
+        reported that there was nothing to migrate. Found by running the tool
+        from a fresh checkout rather than by reading it.
+        """
+        from keystone.db.schema import initialise_database, table_counts
+
+        before = table_counts(migrated[0])
+        initialise_database(migrated[0])
+        after = table_counts(migrated[0])
+        assert after == before
+
+
 class TestTheLoad:
     def test_every_entity_reached_the_target(
         self, migrated: tuple[Settings, MappingSet, AtlasClient, TestClient]
