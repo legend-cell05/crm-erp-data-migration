@@ -1,0 +1,154 @@
+# ===========================================================================
+# Arcadia `cust` -> Atlas Cloud `accounts`
+#
+# Read this file rather than the code: everything that happens to a company
+# record on its way into the new CRM is described here, in order, field by
+# field. If the result is wrong, the fix belongs in this file.
+# ===========================================================================
+version: "1.3.0"
+entity: account
+description: Companies. The root of every other entity, so it migrates first.
+
+source:
+  kind: sql
+  schema: legacy
+  table: cust
+  key: custno
+  # Soft-deleted companies are not migrated. This single line is a business
+  # decision worth stating out loud: the legacy reports never filtered on
+  # del_flag, so the old system's own dashboards counted them.
+  filter: "COALESCE(del_flag, 'N') <> 'Y'"
+
+target:
+  entity_set: accounts
+  alternate_key: arcadia_id
+  description: Upserted on arcadia_id, so a re-run updates rather than duplicates.
+
+fields:
+  - target: arcadia_id
+    source: custno
+    transform: [trim, upper]
+    required: true
+    description: The legacy key, kept in the target as an alternate key.
+
+  - target: name
+    source: company
+    transform:
+      - fix_mojibake
+      - collapse_spaces
+      - title_case
+      - { fn: truncate, length: 160, on_overflow: reject }
+    required: true
+    description: >
+      Truncation rejects rather than cuts. A company name silently losing its
+      last eight characters is worse than a record a human has to look at.
+
+  - target: street
+    source: addr1
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 250 }]
+
+  - target: street_2
+    source: addr2
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 250 }]
+
+  - target: city
+    source: city
+    transform: [fix_mojibake, collapse_spaces, title_case, { fn: truncate, length: 80 }]
+
+  - target: postal_code
+    source: zip
+    transform: [trim, { fn: postal_code, pad_to: 5 }]
+
+  - target: country_code
+    source: ctry
+    transform: [trim]
+    lookup:
+      table: country
+      on_miss: reject
+    required: true
+    description: >
+      A rejection here is the right outcome. 'Frnace' is a typo somebody must
+      decide about; guessing turns one bad record into a country that quietly
+      does not exist in the target's reporting.
+
+  - target: telephone
+    source: phone
+    transform: [{ fn: normalise_phone, default_country_code: "33" }]
+
+  - target: fax
+    source: fax
+    transform: [{ fn: normalise_phone, default_country_code: "33" }]
+
+  - target: vat_number
+    source: vat_no
+    transform: [trim, upper]
+
+  - target: industry
+    source: ind_code
+    transform: [trim, upper]
+    lookup:
+      table: industry
+      on_miss: default
+      default: unclassified
+    description: >
+      Unlike the country, an unknown industry code does not block the record:
+      it lands as 'unclassified' and appears in the impact report, because the
+      business would rather have the customer than the segment.
+
+  - target: status
+    source: status
+    transform:
+      - trim
+      # NULL is not a lookup miss -- it is an absent value, and the lookup
+      # never sees it. The default therefore has to be applied before the
+      # lookup, explicitly, which is also where a reviewer expects to find
+      # the answer to "what happens to a company with no status?".
+      - { fn: default, value_if_missing: PROSPECT }
+      - upper
+    lookup:
+      table: account_status
+      on_miss: default
+      default: prospect
+    required: true
+
+  - target: owner_code
+    source: owner_id
+    transform: [trim, upper]
+
+  - target: description
+    source: notes
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 2000 }]
+
+  - target: created_on
+    source: created
+    transform: [{ fn: parse_date, day_first: true }]
+    description: >
+      day_first is a decision, not a default: '03/04/2021' is the 3rd of April
+      in Arcadia and the 4th of March to a US reader, and the data itself
+      cannot settle it.
+
+  - target: modified_on
+    source: updated
+    transform: [{ fn: parse_date, day_first: true }]
+
+  - target: source_system
+    transform: [{ fn: constant, value_to_use: arcadia }]
+    required: true
+
+validations:
+  - rule: required_together
+    fields: [postal_code, city]
+    message: an address with a postcode but no city cannot be delivered to
+
+  - rule: ordered_dates
+    fields: [created_on, modified_on]
+    severity: warn
+
+  - rule: not_after_today
+    fields: [created_on, modified_on]
+    args: { tolerance_days: 1 }
+
+  - rule: not_before
+    fields: [created_on]
+    args: { earliest: "2000-01-01" }
+    severity: warn

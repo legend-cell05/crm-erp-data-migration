@@ -1,0 +1,371 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Static analysis -- fast, no database, fails the pipeline early.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: python -m ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: python -m ruff format --check .
+
+      - name: mypy
+        run: python -m mypy
+
+  # ---------------------------------------------------------------------------
+  # 2. The mappings are configuration that decides what happens to data, so
+  #    they get their own gate: they must load, order correctly, and name only
+  #    transforms and rules that exist.
+  # ---------------------------------------------------------------------------
+  mappings:
+    name: Validate the mappings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Load, order and check every mapping against the registries
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from keystone.mapping.engine import MappingEngine
+          from keystone.mapping.loader import load_mapping_set
+
+          class Resolver:
+              def resolve(self, entity, source_id): return "x"
+
+          mapping_set = load_mapping_set(directory=Path("mappings"))
+          print("version:", mapping_set.version)
+          print("order:  ", " -> ".join(mapping_set.order))
+          for mapping in mapping_set:
+              MappingEngine(mapping, lookup_dir=mapping_set.lookup_dir, resolver=Resolver())
+              print(f"  {mapping.entity:12} v{mapping.version}  "
+                    f"{len(mapping.fields)} fields, {len(mapping.validations)} validations")
+          PY
+
+      - name: Every target field must exist in the target's own contract
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          from keystone.mapping.loader import load_mapping_set
+          from keystone.target.schemas import SCHEMAS
+
+          # This is the check that catches a mapping drifting away from the
+          # system it writes to -- the failure that otherwise surfaces as
+          # thousands of UNKNOWN_FIELD rejections halfway through a load.
+          problems = []
+          for mapping in load_mapping_set(directory=Path("mappings")):
+              schema = SCHEMAS.get(mapping.target.entity_set)
+              if schema is None:
+                  problems.append(f"{mapping.entity}: unknown entity set {mapping.target.entity_set}")
+                  continue
+              for unknown in sorted(set(mapping.target_fields) - set(schema.fields)):
+                  problems.append(f"{mapping.entity}: target has no field {unknown!r}")
+              for name, rule in schema.fields.items():
+                  if rule.required and name not in mapping.target_fields:
+                      problems.append(f"{mapping.entity}: required target field {name!r} is not mapped")
+          if problems:
+              print("\n".join(problems)); sys.exit(1)
+          print("every mapping agrees with the target contract")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 3. Tests -- unit tests on every supported Python, integration tests against
+  #    a real PostgreSQL service container. The SQL and the driver behaviour
+  #    are the thing under test; mocking them would prove nothing.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: keystone_test
+          POSTGRES_USER: keystone_app
+          # Test-only credential for an ephemeral container destroyed with the
+          # job and unreachable from outside the runner.
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keystone_app -d keystone_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      KEYSTONE_DB_HOST: localhost
+      KEYSTONE_DB_PORT: 5432
+      KEYSTONE_DB_NAME: keystone_test
+      KEYSTONE_DB_USER: keystone_app
+      KEYSTONE_DB_PASSWORD: ci_test_password
+      KEYSTONE_RUN_INTEGRATION: "1"
+      KEYSTONE_LOG_LEVEL: WARNING
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: python -m pytest tests/unit -v --junitxml=junit-unit.xml
+
+      - name: Integration tests
+        run: python -m pytest tests/integration -v --junitxml=junit-integration.xml
+
+      - name: Coverage
+        if: matrix.python-version == '3.12'
+        run: python -m pytest tests --cov --cov-report=xml --cov-report=term-missing
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            junit-*.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 4. End-to-end -- the migration must actually run against the target over
+  #    HTTP and prove the properties the README claims: a gate that refuses,
+  #    an idempotent re-run, and rejections that name their cause.
+  # ---------------------------------------------------------------------------
+  migration:
+    name: End-to-end migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [lint, mappings]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: keystone
+          POSTGRES_USER: keystone_app
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keystone_app -d keystone"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      KEYSTONE_DB_HOST: localhost
+      KEYSTONE_DB_PORT: 5432
+      KEYSTONE_DB_NAME: keystone
+      KEYSTONE_DB_USER: keystone_app
+      KEYSTONE_DB_PASSWORD: ci_test_password
+      KEYSTONE_TARGET_BASE_URL: http://localhost:8080
+      KEYSTONE_LOG_LEVEL: INFO
+      # Smaller than the default so the job stays quick; the shape of the data
+      # and every defect in it are identical.
+      KEYSTONE_N_ACCOUNTS: "300"
+      KEYSTONE_N_CONTACTS: "900"
+      KEYSTONE_N_OPPORTUNITIES: "500"
+      KEYSTONE_N_ACTIVITIES: "1500"
+      # Faults stay ON: a retry policy that has never retried anything in CI
+      # is a retry policy nobody has tested.
+      KEYSTONE_TARGET_FAULT_RATE: "0.05"
+      KEYSTONE_TARGET_RATE_LIMIT_RATE: "0.06"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Start the simulated target
+        run: |
+          nohup keystone serve --host 127.0.0.1 --port 8080 > atlas.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /dev/null; then echo "target is up"; exit 0; fi
+            sleep 1
+          done
+          echo "target did not start"; cat atlas.log; exit 1
+
+      - name: Seed the legacy CRM
+        run: keystone seed
+
+      - name: A load without a dry-run must be refused
+        run: |
+          set +e
+          keystone load
+          code=$?
+          set -e
+          # Exit code 3 is "blocked by a gate", which is the whole point of
+          # the design. Any other code means the gate did not do its job.
+          if [ "$code" -ne 3 ]; then
+            echo "expected exit code 3 (blocked), got $code"; exit 1
+          fi
+          echo "gate refused the load, as designed"
+
+      - name: Dry-run
+        run: keystone dry-run
+
+      - name: The dry-run must have written nothing to the target
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          with urllib.request.urlopen("http://localhost:8080/admin/stats") as response:
+              stats = json.load(response)
+          assert stats["total"] == 0, f"the dry-run wrote {stats['total']} record(s) to the target"
+          print("dry-run verified: the target is still empty")
+          PY
+
+      - name: Load
+        run: keystone load
+
+      - name: Prove the re-run is idempotent
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, urllib.request
+
+          def stats():
+              with urllib.request.urlopen("http://localhost:8080/admin/stats") as response:
+                  return json.load(response)
+
+          before = stats()
+          subprocess.run(["keystone", "load"], check=True)
+          after = stats()
+          assert after["counts"] == before["counts"], "a re-run changed the row counts"
+          assert after["writes_applied"] == before["writes_applied"], "a re-run rewrote records"
+          print(f"idempotency verified: {after['total']} records, no further writes")
+          PY
+
+      - name: Reconcile
+        run: keystone reconcile
+
+      - name: Rejections must be recorded with a cause
+        run: |
+          keystone rejects --show-examples
+          python - <<'PY'
+          from keystone.config import get_settings
+          from keystone.load.rejects import RejectStore
+
+          summary = RejectStore(get_settings()).summary()
+          # The generator injects defects on purpose. Zero rejections would
+          # mean the mapping rules are not being applied at all.
+          assert summary, "no rejections recorded -- are the rules running?"
+          assert all(row["rule"] for row in summary), "a rejection with no rule is not actionable"
+          print(f"{sum(r['records'] for r in summary)} record(s) rejected, every one with a cause")
+          PY
+
+      - name: Crosswalk, runs and report
+        run: |
+          keystone crosswalk
+          keystone runs
+          keystone export-report
+
+      - name: Upload the impact report and the target log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-artifacts
+          path: |
+            data/reports/*.md
+            data/reports/*.json
+            atlas.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 5. Container build -- built and smoke-tested, never pushed.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: crm-erp-data-migration:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm crm-erp-data-migration:ci --version
+          docker run --rm crm-erp-data-migration:ci registry
+          # The image must not run as root.
+          test "$(docker run --rm --entrypoint id crm-erp-data-migration:ci -u)" != "0"

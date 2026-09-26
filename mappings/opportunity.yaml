@@ -1,0 +1,113 @@
+# ===========================================================================
+# Arcadia `deal` -> Atlas Cloud `opportunities`
+# ===========================================================================
+version: "1.1.0"
+entity: opportunity
+description: Sales opportunities. Amounts and probabilities were free text in Arcadia.
+depends_on: [account, contact]
+
+source:
+  kind: sql
+  schema: legacy
+  table: deal
+  key: dealno
+  filter: "COALESCE(del_flag, 'N') <> 'Y'"
+
+target:
+  entity_set: opportunities
+  alternate_key: arcadia_id
+
+fields:
+  - target: arcadia_id
+    source: dealno
+    transform: [trim, upper]
+    required: true
+
+  - target: account_id
+    source: custno
+    transform: [trim, upper]
+    reference:
+      entity: account
+      on_missing: reject
+    required: true
+
+  - target: contact_id
+    source: persno
+    transform: [trim, upper]
+    reference:
+      entity: contact
+      on_missing: "null"
+    description: >
+      Unlike the account, a missing contact does not sink the opportunity: the
+      deal belongs to the company, and the named contact may simply have left.
+
+  - target: name
+    source: descr
+    transform: [fix_mojibake, collapse_spaces, { fn: truncate, length: 200 }]
+    required: true
+
+  - target: amount
+    source: amount
+    transform: [{ fn: parse_amount, decimals: 2 }]
+    description: >
+      Handles '12 500,00', '$ 12,500.00' and '€12 500,00 EUR'. The rule for
+      the ambiguous case is that the last separator is the decimal mark.
+
+  - target: currency
+    source: curr
+    transform:
+      - trim
+      - { fn: default, value_if_missing: EUR }
+      - upper
+    lookup:
+      table: currency
+      on_miss: reject
+
+  - target: stage
+    source: stage_cd
+    transform: [trim, upper]
+    lookup:
+      table: deal_stage
+      on_miss: reject
+    required: true
+    description: >
+      Rejecting unknown stages is the point of the exercise: Arcadia let users
+      type free text into this field, and a pipeline report built on invented
+      stages is worse than one that is missing rows.
+
+  - target: probability
+    source: prob
+    transform: [parse_percentage]
+
+  - target: close_date
+    source: close_dt
+    transform: [{ fn: parse_date, day_first: true }]
+
+  - target: owner_code
+    source: owner_id
+    transform: [trim, upper]
+
+  - target: created_on
+    source: created
+    transform: [{ fn: parse_date, day_first: true }]
+
+  - target: source_system
+    transform: [{ fn: constant, value_to_use: arcadia }]
+    required: true
+
+validations:
+  - rule: non_negative
+    fields: [amount]
+
+  - rule: ordered_dates
+    fields: [created_on, close_date]
+    severity: warn
+
+  - rule: consistent_stage_probability
+    fields: [stage, probability]
+    args:
+      stage_field: stage
+      probability_field: probability
+      closed_stages: [closed_won]
+    severity: warn
+    message: opportunity is marked won but its probability is not 100

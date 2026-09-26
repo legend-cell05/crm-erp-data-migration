@@ -1,0 +1,112 @@
+# =============================================================================
+# Local stack: PostgreSQL + the simulated target CRM + the migration tool.
+#
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Three services because that is the real shape of the problem: the database
+# holding the legacy system and the migration's own state, a target API the
+# migration does not control, and the tool itself.
+#
+# The `keystone` service seeds, dry-runs, loads and reconciles once, then
+# exits. Run anything else on demand:
+#
+#   docker compose run --rm keystone dry-run
+#   docker compose run --rm keystone rejects --show-examples
+#   docker compose run --rm keystone crosswalk --entity account --source-id C-000001
+#
+# No credential is hard-coded: every value comes from .env, which is
+# git-ignored. The defaults after `:-` are obviously-local placeholders.
+# =============================================================================
+
+x-database-env: &database-env
+  KEYSTONE_DB_HOST: postgres
+  KEYSTONE_DB_PORT: 5432
+  KEYSTONE_DB_NAME: ${KEYSTONE_DB_NAME:-keystone}
+  KEYSTONE_DB_USER: ${KEYSTONE_DB_USER:-keystone_app}
+  KEYSTONE_DB_PASSWORD: ${KEYSTONE_DB_PASSWORD:-change_me_local_only}
+  KEYSTONE_LOG_LEVEL: ${KEYSTONE_LOG_LEVEL:-INFO}
+  KEYSTONE_LOG_FORMAT: ${KEYSTONE_LOG_FORMAT:-text}
+  KEYSTONE_PROJECT_ROOT: /app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: keystone-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${KEYSTONE_DB_NAME:-keystone}
+      POSTGRES_USER: ${KEYSTONE_DB_USER:-keystone_app}
+      POSTGRES_PASSWORD: ${KEYSTONE_DB_PASSWORD:-change_me_local_only}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${KEYSTONE_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # The migration waits on this. Starting a load against a database that
+      # is still initialising is the classic compose race condition.
+      test: ["CMD-SHELL", "pg_isready -U ${KEYSTONE_DB_USER:-keystone_app} -d ${KEYSTONE_DB_NAME:-keystone}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # The simulated target CRM. keystone is its client and gets no special
+  # treatment: same API key, same batch limit, same rate limits, same 503s.
+  atlas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: keystone-atlas
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      KEYSTONE_TARGET_API_KEY: ${KEYSTONE_TARGET_API_KEY:-local_dev_key_not_a_secret}
+      KEYSTONE_TARGET_FAULT_RATE: ${KEYSTONE_TARGET_FAULT_RATE:-0.05}
+      KEYSTONE_TARGET_RATE_LIMIT_RATE: ${KEYSTONE_TARGET_RATE_LIMIT_RATE:-0.06}
+    ports:
+      - "${KEYSTONE_TARGET_PORT:-8080}:8080"
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  keystone:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: keystone-migration
+    depends_on:
+      postgres:
+        condition: service_healthy
+      atlas:
+        condition: service_healthy
+    environment:
+      <<: *database-env
+      # Inside the compose network the target is reachable by service name,
+      # whatever port is published on the host.
+      KEYSTONE_TARGET_BASE_URL: http://atlas:8080
+      KEYSTONE_TARGET_API_KEY: ${KEYSTONE_TARGET_API_KEY:-local_dev_key_not_a_secret}
+      KEYSTONE_RANDOM_SEED: ${KEYSTONE_RANDOM_SEED:-20260220}
+      KEYSTONE_N_ACCOUNTS: ${KEYSTONE_N_ACCOUNTS:-1200}
+      KEYSTONE_N_CONTACTS: ${KEYSTONE_N_CONTACTS:-4000}
+      KEYSTONE_N_OPPORTUNITIES: ${KEYSTONE_N_OPPORTUNITIES:-2600}
+      KEYSTONE_N_ACTIVITIES: ${KEYSTONE_N_ACTIVITIES:-9000}
+      KEYSTONE_MAX_REJECT_RATE_PCT: ${KEYSTONE_MAX_REJECT_RATE_PCT:-5.0}
+    volumes:
+      # The reports are for people, so they belong on the host.
+      - ./data:/app/data
+    # seed, then dry-run, then load, then reconcile -- the order is the point.
+    command: ["migrate"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+    driver: local
