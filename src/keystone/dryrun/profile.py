@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,7 +92,7 @@ def _profile_sql(mapping: EntityMapping, settings: Settings) -> list[ColumnProfi
             row = conn.execute(text(query)).mappings().one()
             profiles = []
             for index, column in enumerate(columns):
-                samples = (
+                samples: Sequence[Any] = (
                     conn.execute(
                         text(
                             f"""SELECT DISTINCT CAST({column} AS TEXT) AS value
