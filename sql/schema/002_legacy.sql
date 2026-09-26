@@ -16,16 +16,15 @@
 -- IS this schema.
 -- ===========================================================================
 
-DROP TABLE IF EXISTS ${LEGACY}.act CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.deal CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.person CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.cust CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.usr CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.ref_stage CASCADE;
-DROP TABLE IF EXISTS ${LEGACY}.ref_industry CASCADE;
+-- Every table below is CREATE TABLE IF NOT EXISTS, and there is deliberately
+-- no DROP. `keystone init-db` is documented as safe to re-run, and an earlier
+-- version of this file began with DROP TABLE -- which meant that re-running it
+-- silently emptied the source system. The generator truncates before it
+-- inserts, so re-seeding still works; re-initialising no longer destroys
+-- anything.
 
 -- Users of the old system. Some are inactive; some own records anyway.
-CREATE TABLE ${LEGACY}.usr (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.usr (
     usr_id      VARCHAR(10) PRIMARY KEY,
     login       VARCHAR(30),
     fullname    VARCHAR(80),
@@ -35,20 +34,20 @@ CREATE TABLE ${LEGACY}.usr (
 
 -- Code tables. Deliberately incomplete: the application let users type codes
 -- that were never registered here.
-CREATE TABLE ${LEGACY}.ref_stage (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.ref_stage (
     stage_cd    VARCHAR(10) PRIMARY KEY,
     label       VARCHAR(60),
     is_won      CHAR(1),
     is_closed   CHAR(1)
 );
 
-CREATE TABLE ${LEGACY}.ref_industry (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.ref_industry (
     ind_code    VARCHAR(10) PRIMARY KEY,
     label       VARCHAR(60)
 );
 
 -- Companies.
-CREATE TABLE ${LEGACY}.cust (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.cust (
     custno      VARCHAR(12) PRIMARY KEY,   -- 'C-000123'
     company     VARCHAR(120),
     addr1       VARCHAR(120),
@@ -69,7 +68,7 @@ CREATE TABLE ${LEGACY}.cust (
 );
 
 -- People.
-CREATE TABLE ${LEGACY}.person (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.person (
     persno      VARCHAR(12) PRIMARY KEY,
     custno      VARCHAR(12),               -- no FK: orphans exist
     fname       VARCHAR(60),
@@ -85,7 +84,7 @@ CREATE TABLE ${LEGACY}.person (
 );
 
 -- Opportunities. Amounts are text, with whatever the user typed.
-CREATE TABLE ${LEGACY}.deal (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.deal (
     dealno      VARCHAR(12) PRIMARY KEY,
     custno      VARCHAR(12),
     persno      VARCHAR(12),
@@ -102,7 +101,7 @@ CREATE TABLE ${LEGACY}.deal (
 
 -- Activity log. Also exported nightly to CSV, which is the copy keystone
 -- reads -- see the file extractor.
-CREATE TABLE ${LEGACY}.act (
+CREATE TABLE IF NOT EXISTS ${LEGACY}.act (
     actno       VARCHAR(12) PRIMARY KEY,
     custno      VARCHAR(12),
     persno      VARCHAR(12),
