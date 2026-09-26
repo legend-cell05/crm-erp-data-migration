@@ -89,8 +89,13 @@ def table_counts(settings: Settings | None = None) -> dict[str, int]:
                 {"schemas": [settings.legacy_schema, settings.migration_schema]},
             ).all()
             for schema, table in rows:
-                count = conn.execute(text(f"SELECT COUNT(*) FROM {schema}.{table}")).scalar_one()
-                counts[f"{schema}.{table}"] = int(count)
+                # Annotated because SQLAlchemy 2.1 types scalar_one() as a
+                # TypeVar that cannot be solved here: the query is built from
+                # a string, so there is no Select[...] to infer from.
+                count: int = conn.execute(
+                    text(f"SELECT COUNT(*) FROM {schema}.{table}")
+                ).scalar_one()
+                counts[f"{schema}.{table}"] = count
     except SQLAlchemyError as exc:
         raise DatabaseError(f"failed to count tables: {exc}") from exc
     return counts
