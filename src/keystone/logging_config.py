@@ -59,6 +59,43 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _SafeLogger(logging.Logger):
+    """A logger whose ``extra`` cannot crash the program.
+
+    ``LogRecord`` owns a set of attribute names, and passing any of them in
+    ``extra`` raises ``KeyError`` -- at the log call, in production, long after
+    the code was reviewed. That is a real trap here: a load report naturally
+    has a field called ``created``, which is also the timestamp every
+    ``LogRecord`` carries.
+
+    Renaming the collision to ``ctx_created`` keeps the value, keeps the log
+    line, and keeps the program running. Logging must never be the thing that
+    breaks a migration.
+    """
+
+    def makeRecord(  # noqa: N802 - the name is logging's API, not a choice
+        self,
+        name: str,
+        level: int,
+        fn: str,
+        lno: int,
+        msg: object,
+        args: Any,
+        exc_info: Any,
+        func: str | None = None,
+        extra: Any = None,
+        sinfo: str | None = None,
+    ) -> logging.LogRecord:
+        if extra:
+            extra = {
+                (f"ctx_{key}" if key in _RESERVED else key): value for key, value in extra.items()
+            }
+        return super().makeRecord(name, level, fn, lno, msg, args, exc_info, func, extra, sinfo)
+
+
+logging.setLoggerClass(_SafeLogger)
+
+
 def configure_logging(level: str = "INFO", fmt: str = "text") -> None:
     """Install a single stdout handler. Safe to call more than once."""
     root = logging.getLogger()
