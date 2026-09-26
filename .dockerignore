@@ -1,0 +1,25 @@
+# Keep the build context small and never ship secrets or generated data.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+junit-*.xml
+
+.env
+.env.*
+!.env.example
+
+data/legacy_exports/*
+data/reports/*
+docs/
+tests/
+*.md
+!README.md
